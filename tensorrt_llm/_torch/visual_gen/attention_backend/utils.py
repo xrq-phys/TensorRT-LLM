@@ -20,6 +20,7 @@ Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
 that handle metadata preparation internally for simplified usage.
 """
 
+import importlib
 from typing import Optional, Type
 
 import torch
@@ -37,7 +38,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "FLASHINFER")
 
     Returns:
         Diffusion attention backend class
@@ -49,6 +50,8 @@ def get_visual_gen_attention_backend(
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                          Requires flash-attn package with cute interface
+        - "FLASHINFER": FlashInfer ragged DiT attention path. Falls back to
+                        VANILLA if the flashinfer package is not importable.
     """
     # Lazy imports to avoid circular dependency
     from .flash_attn4 import FlashAttn4Attention
@@ -63,6 +66,14 @@ def get_visual_gen_attention_backend(
         return TrtllmAttention
     elif backend_name == "FA4":
         return FlashAttn4Attention
+    elif backend_name == "FLASHINFER":
+        try:
+            flashinfer_module = importlib.import_module(
+                "tensorrt_llm._torch.visual_gen.attention_backend.flashinfer"
+            )
+        except (ImportError, OSError, RuntimeError):
+            return VanillaAttention
+        return flashinfer_module.FlashInferAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -89,7 +100,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "FLASHINFER")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -117,6 +128,8 @@ def create_attention(
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
+    else:
+        kwargs["attention_config"] = attention_config or AttentionConfig(backend=backend.upper())
 
     return attn_cls(
         layer_idx=layer_idx,

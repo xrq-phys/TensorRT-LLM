@@ -30,7 +30,8 @@
 #    - PROJECT_DIR:     path to TensorRT-LLM source on the shared filesystem
 #    - MODEL_PATH:      HuggingFace Hub model ID or local path (default: Wan-AI/Wan2.2-T2V-A14B-Diffusers)
 #    - OUTPUT_PATH:        path to save generated video (default: output.avi)
-#    - ATTENTION_BACKEND:  attention backend to use (default: FA4; options: VANILLA, TRTLLM, FA4)
+#    - ATTENTION_BACKEND:  attention backend to use (default: FA4; options: VANILLA, TRTLLM, FA4, FLASHINFER)
+#    - ATTENTION_QUANTIZATION_TYPE: FlashInfer attention quantization type (default: no_quant)
 #    - CFG_SIZE:           CFG parallel size (1 or 2)
 #    - ULYSSES_SIZE:       Ulysses sequence parallel size
 #    - MASTER_PORT:        NCCL rendezvous port (default: 29500)
@@ -63,6 +64,7 @@ WIDTH="${WIDTH:-1280}"
 NUM_FRAMES="${NUM_FRAMES:-81}"
 NUM_STEPS="${NUM_STEPS:-40}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-FA4}"
+ATTENTION_QUANTIZATION_TYPE="${ATTENTION_QUANTIZATION_TYPE:-no_quant}"
 
 # Parallelism
 CFG_SIZE="${CFG_SIZE:-2}"
@@ -98,6 +100,7 @@ RUN_CMD="python examples/visual_gen/visual_gen_wan_t2v.py \
         --height ${HEIGHT} --width ${WIDTH} --num_frames ${NUM_FRAMES} \
         --steps ${NUM_STEPS} \
         --attention_backend ${ATTENTION_BACKEND} \
+        --attention_quantization_type ${ATTENTION_QUANTIZATION_TYPE} \
         --cfg_size ${CFG_SIZE} \
         --ulysses_size ${ULYSSES_SIZE} \
         --output_path '${OUTPUT_PATH}'"

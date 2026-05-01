@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.visual_gen.attention_backend import utils as attention_backend_utils
+from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
     CacheDiTConfig,
@@ -44,6 +46,47 @@ class TestVisualGenArgsStrictValidation:
     def test_nested_attention_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             AttentionConfig(backend="VANILLA", extra_key="bad")
+
+    @pytest.mark.parametrize(
+        "quantization_type",
+        ["no_quant", "qkv_fp8", "qk_bf16_v_fp8"],
+    )
+    def test_flashinfer_attention_quantization_type_allowed(self, quantization_type):
+        config = AttentionConfig(
+            backend="FLASHINFER",
+            quantization_type=quantization_type,
+        )
+        assert config.quantization_type == quantization_type
+
+    @pytest.mark.parametrize("quantization_type", ["qkv_fp8", "qk_bf16_v_fp8"])
+    def test_attention_quantization_type_resets_for_unsupported_backend(
+        self,
+        quantization_type,
+    ):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            config = AttentionConfig(
+                backend="VANILLA",
+                quantization_type=quantization_type,
+            )
+
+        assert config.quantization_type == "no_quant"
+        assert critical.called
+
+    def test_flashinfer_attention_import_failure_falls_back_to_vanilla(self):
+        def raise_import_error(module_name):
+            if module_name.endswith(".flashinfer"):
+                raise ImportError("flashinfer unavailable")
+            return original_import_module(module_name)
+
+        original_import_module = attention_backend_utils.importlib.import_module
+        with patch(
+            "tensorrt_llm._torch.visual_gen.attention_backend.utils.importlib.import_module",
+            side_effect=raise_import_error,
+        ):
+            assert (
+                attention_backend_utils.get_visual_gen_attention_backend("FLASHINFER")
+                is VanillaAttention
+            )
 
     def test_nested_teacache_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):

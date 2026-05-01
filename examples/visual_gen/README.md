@@ -243,7 +243,8 @@ python visual_gen_ltx2.py \
 | `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, `FA4`, or `FLASHINFER` |
+| `--attention_quantization_type` | ✓ | ✓ | — | no_quant | `no_quant`, `qkv_fp8`, or `qk_bf16_v_fp8` for `FLASHINFER` |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Sequence parallelism |
 | `--linear_type` | ✓ | ✓ | — | default | Quantization type |
@@ -263,6 +264,7 @@ python visual_gen_ltx2.py \
 **Slow Inference:**
 - Enable TeaCache: `--enable_teacache`
 - Use TRTLLM backend: `--attention_backend TRTLLM`
+- Use FlashInfer ragged DiT backend: `--attention_backend FLASHINFER`
 - Use multi-GPU: `--cfg_size 2` or `--ulysses_size 2`
 
 **Import Errors:**

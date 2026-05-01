@@ -273,9 +273,17 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM"],
-        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
+        choices=["VANILLA", "TRTLLM", "FLASHINFER"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
+        "FLASHINFER: FlashInfer ragged DiT). "
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
+    )
+    parser.add_argument(
+        "--attention_quantization_type",
+        type=str,
+        default="no_quant",
+        choices=["no_quant", "qkv_fp8", "qk_bf16_v_fp8"],
+        help="Attention quantization type. FP8 variants are supported only by FLASHINFER.",
     )
 
     return parser.parse_args()
@@ -324,7 +332,10 @@ def _build_diffusion_args(args) -> VisualGenArgs:
     kwargs = dict(
         text_encoder_path=args.text_encoder_path,
         **cache_kwargs,
-        attention={"backend": args.attention_backend},
+        attention={
+            "backend": args.attention_backend,
+            "quantization_type": args.attention_quantization_type,
+        },
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,

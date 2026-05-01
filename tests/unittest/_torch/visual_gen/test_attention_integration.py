@@ -25,10 +25,25 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 
+try:
+    from tensorrt_llm._torch.visual_gen.attention_backend import flashinfer as _flashinfer_backend
+except ImportError:
+    _flashinfer_backend = None
+
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
 _flash_attn4_available = _fa4_fwd is not None
+_flashinfer_available = _flashinfer_backend is not None
+
+
+def _attention_tolerance(quantization_type: str) -> tuple[float, float]:
+    if quantization_type == "qkv_fp8":
+        return 1e-1, 1e-1
+    if quantization_type == "qk_bf16_v_fp8":
+        return 5e-2, 5e-2
+    return 1e-2, 1e-2
+
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -117,6 +132,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
+    quantization_type: str = "no_quant",
 ):
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -126,10 +142,13 @@ def create_model_config(
         eps=eps,
     )
 
-    # Create a minimal config without quantization
+    # Create a minimal config with optional attention quantization.
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        attention=AttentionConfig(backend=attn_backend),
+        attention=AttentionConfig(
+            backend=attn_backend,
+            quantization_type=quantization_type,
+        ),
         skip_create_weights_in_init=False,
     )
     config.attention_metadata_state = (
@@ -209,11 +228,24 @@ def generate_rope_embeddings(
 # ============================================================================
 # Test functions
 # ============================================================================
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM", "FA4"])
-def test_self_attention_equivalence(attn_backend: str):
+@pytest.mark.parametrize(
+    "attn_backend,quantization_type",
+    [
+        ("VANILLA", "no_quant"),
+        ("TRTLLM", "no_quant"),
+        ("FA4", "no_quant"),
+        *[
+            ("FLASHINFER", quantization_type)
+            for quantization_type in ("no_quant", "qkv_fp8", "qk_bf16_v_fp8")
+        ],
+    ],
+)
+def test_self_attention_equivalence(attn_backend: str, quantization_type: str = "no_quant"):
     """Test that integrated self-attention produces same output as naive."""
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 self-attention test")
+    if attn_backend == "FLASHINFER" and not _flashinfer_available:
+        pytest.skip("FlashInfer ragged DiT attention is not available")
 
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
@@ -229,12 +261,19 @@ def test_self_attention_equivalence(attn_backend: str):
     dtype = torch.bfloat16  # Use bf16 since flashinfer doesn't support fp32
 
     print(f"Config: B={batch_size}, S={seq_len}, H={hidden_size}, heads={num_heads}")
+    print(f"Backend: {attn_backend}, quantization_type: {quantization_type}")
     print(f"Device: {device}, dtype: {dtype}")
 
     # Create models
     naive = NaiveWanSelfAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
 
-    model_config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=attn_backend)
+    model_config = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend=attn_backend,
+        quantization_type=quantization_type,
+    )
     integrated = Attention(
         hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=model_config
     ).to(device)  # self attention
@@ -260,15 +299,16 @@ def test_self_attention_equivalence(attn_backend: str):
         out_integrated = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
 
     # Compare (using looser tolerance for bf16)
+    rtol, atol = _attention_tolerance(quantization_type)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
+    is_close = torch.allclose(out_naive, out_integrated, rtol=rtol, atol=atol)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
+    print(f"  Outputs match (rtol={rtol:.1e}, atol={atol:.1e}): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Self-attention outputs match!")
@@ -281,11 +321,20 @@ def test_self_attention_equivalence(attn_backend: str):
     return is_close
 
 
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "FA4"])
-def test_cross_attention_equivalence(attn_backend: str):
+@pytest.mark.parametrize(
+    "attn_backend,quantization_type",
+    [
+        ("VANILLA", "no_quant"),
+        ("FLASHINFER", "no_quant"),
+        ("FA4", "no_quant"),
+    ],
+)
+def test_cross_attention_equivalence(attn_backend: str, quantization_type: str = "no_quant"):
     """Test that integrated cross-attention produces same output as naive."""
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 cross-attention test")
+    if attn_backend == "FLASHINFER" and not _flashinfer_available:
+        pytest.skip("FlashInfer ragged DiT attention is not available")
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -304,6 +353,7 @@ def test_cross_attention_equivalence(attn_backend: str):
     print(
         f"Config: B={batch_size}, S_q={seq_len}, S_kv={encoder_seq_len}, H={hidden_size}, heads={num_heads}"
     )
+    print(f"Backend: {attn_backend}, quantization_type: {quantization_type}")
     print(f"Device: {device}, dtype: {dtype}")
 
     # Create models
@@ -334,15 +384,16 @@ def test_cross_attention_equivalence(attn_backend: str):
         out_integrated = integrated(hidden_states, encoder_hidden_states)
 
     # Compare (using looser tolerance for bf16)
+    rtol, atol = _attention_tolerance(quantization_type)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
+    is_close = torch.allclose(out_naive, out_integrated, rtol=rtol, atol=atol)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
+    print(f"  Outputs match (rtol={rtol:.1e}, atol={atol:.1e}): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Cross-attention outputs match!")
@@ -588,6 +639,15 @@ def run_all_tests():
     results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA")
     if _flash_attn4_available:
         results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4")
+
+    if _flashinfer_available:
+        for quantization_type in ("no_quant", "qkv_fp8", "qk_bf16_v_fp8"):
+            suffix = f"FLASHINFER_{quantization_type}"
+            results[f"self_attention_{suffix}"] = test_self_attention_equivalence(
+                "FLASHINFER",
+                quantization_type,
+            )
+        results["cross_attention_FLASHINFER"] = test_cross_attention_equivalence("FLASHINFER")
 
     # Run TRTLLM-specific caching tests
     results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()

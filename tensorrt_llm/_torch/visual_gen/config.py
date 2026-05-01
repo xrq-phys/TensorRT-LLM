@@ -54,9 +54,28 @@ class PipelineComponent(str, Enum):
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
-        "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "FLASHINFER"] = PydanticField(
+        "VANILLA",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, FLASHINFER",
     )
+    quantization_type: Literal["no_quant", "qkv_fp8", "qk_bf16_v_fp8"] = PydanticField(
+        "no_quant",
+        description=(
+            "Attention quantization type. qkv_fp8 and qk_bf16_v_fp8 are currently "
+            "supported only by the FLASHINFER backend."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_quantization_type(self) -> "AttentionConfig":
+        if self.quantization_type != "no_quant":
+            if self.backend not in ["FLASHINFER"]:
+                logger.critical(
+                    f"Attention quantization_type {self.quantization_type} is not supported "
+                    f"by the {self.backend} backend. Resetting to no_quant."
+                )
+                self.quantization_type = "no_quant"
+        return self
 
 
 class ParallelConfig(StrictBaseModel):
