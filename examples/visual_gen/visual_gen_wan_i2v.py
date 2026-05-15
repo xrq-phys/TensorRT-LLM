@@ -196,16 +196,13 @@ def parse_args():
         "FA4: Flash Attention 4). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
-
-    # SageAttention (requires --attention_backend TRTLLM)
     parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help=(
-            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
-            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1, "
-            "(1, 16, 1) otherwise."
-        ),
+        "--context_quantization_mode",
+        type=str,
+        default="NO_QUANT",
+        choices=["NO_QUANT", "QK16PV8", "SAGE"],
+        help="Context attention quantization mode. QK16PV8 requires --attention_backend FA4. "
+        "SAGE requires --attention_backend TRTLLM.",
     )
 
     # Parallelism
@@ -327,6 +324,7 @@ def main():
 
     attention_cfg = {
         "backend": args.attention_backend,
+        "context_quantization_mode": args.context_quantization_mode,
     }
     if args.enable_sage_attention:
         num_elts_per_blk_k = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16

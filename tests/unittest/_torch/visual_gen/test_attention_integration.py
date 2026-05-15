@@ -118,6 +118,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
+    context_quantization_mode: str = "NO_QUANT",
     sage_attention_config: "SageAttentionConfig | None" = None,
 ):
     """Create a mock DiffusionModelConfig for testing."""
@@ -133,6 +134,7 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend=attn_backend,
+            context_quantization_mode=context_quantization_mode,
             sage_attention_config=sage_attention_config,
         ),
         skip_create_weights_in_init=False,
@@ -214,8 +216,16 @@ def generate_rope_embeddings(
 # ============================================================================
 # Test functions
 # ============================================================================
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM", "FA4"])
-def test_self_attention_equivalence(attn_backend: str):
+@pytest.mark.parametrize(
+    ("attn_backend", "context_quantization_mode"),
+    [
+        ("VANILLA", "NO_QUANT"),
+        ("TRTLLM", "NO_QUANT"),
+        ("FA4", "NO_QUANT"),
+        ("FA4", "QK16PV8"),
+    ],
+)
+def test_self_attention_equivalence(attn_backend: str, context_quantization_mode: str):
     """Test that integrated self-attention produces same output as naive."""
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 self-attention test")
@@ -239,7 +249,13 @@ def test_self_attention_equivalence(attn_backend: str):
     # Create models
     naive = NaiveWanSelfAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
 
-    model_config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=attn_backend)
+    model_config = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend=attn_backend,
+        context_quantization_mode=context_quantization_mode,
+    )
     integrated = Attention(
         hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=model_config
     ).to(device)  # self attention
@@ -331,6 +347,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
         num_heads,
         head_dim,
         attn_backend="TRTLLM",
+        context_quantization_mode="SAGE",
         sage_attention_config=sage_cfg,
     )
     integrated = Attention(
@@ -387,8 +404,15 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     return cos_sim > 0.99
 
 
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "FA4"])
-def test_cross_attention_equivalence(attn_backend: str):
+@pytest.mark.parametrize(
+    ("attn_backend", "context_quantization_mode"),
+    [
+        ("VANILLA", "NO_QUANT"),
+        ("FA4", "NO_QUANT"),
+        ("FA4", "QK16PV8"),
+    ],
+)
+def test_cross_attention_equivalence(attn_backend: str, context_quantization_mode: str):
     """Test that integrated cross-attention produces same output as naive."""
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 cross-attention test")
@@ -415,7 +439,13 @@ def test_cross_attention_equivalence(attn_backend: str):
     # Create models
     naive = NaiveWanCrossAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
 
-    model_config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=attn_backend)
+    model_config = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend=attn_backend,
+        context_quantization_mode=context_quantization_mode,
+    )
     integrated = Attention(
         hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=model_config
     ).to(device)  # cross attention
@@ -468,8 +498,14 @@ def test_cross_attention_equivalence(attn_backend: str):
         (1, 2048, 512, 12, 128),
     ],
 )
+@pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT", "QK16PV8"])
 def test_fa4_cross_attention_wan_shapes(
-    batch: int, seq_len_q: int, seq_len_kv: int, num_heads: int, head_dim: int
+    batch: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_heads: int,
+    head_dim: int,
+    context_quantization_mode: str,
 ):
     """Test FA4 cross-attention correctness at Wan-realistic shapes."""
     if not _flash_attn4_available:
@@ -490,7 +526,13 @@ def test_fa4_cross_attention_wan_shapes(
         device
     )
 
-    cfg_fa4 = create_model_config(hidden_size, num_heads, head_dim, attn_backend="FA4")
+    cfg_fa4 = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend="FA4",
+        context_quantization_mode=context_quantization_mode,
+    )
     fa4_model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg_fa4).to(
         device
     )
@@ -688,7 +730,7 @@ def run_all_tests():
 
     # Run self-attention tests with different backends
     for backend in ["VANILLA", "TRTLLM"] + (["FA4"] if _flash_attn4_available else []):
-        results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend)
+        results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend, "NO_QUANT")
 
     # Run SageAttention self-attention tests (subset for manual runner)
     for batch_size in [1, 2]:
@@ -700,9 +742,9 @@ def run_all_tests():
                 )
 
     # Run cross-attention tests
-    results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA")
+    results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA", "NO_QUANT")
     if _flash_attn4_available:
-        results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4")
+        results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4", "NO_QUANT")
 
     # Run TRTLLM-specific caching tests
     results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()

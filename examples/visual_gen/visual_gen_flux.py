@@ -215,9 +215,12 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
     parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+        "--context_quantization_mode",
+        type=str,
+        default="NO_QUANT",
+        choices=["NO_QUANT", "QK16PV8", "SAGE"],
+        help="Context attention quantization mode. QK16PV8 requires --attention_backend FA4. "
+        "SAGE requires --attention_backend TRTLLM.",
     )
 
     # Parallelism
@@ -341,7 +344,10 @@ def build_diffusion_args(args) -> VisualGenArgs:
     else:
         cache_kwargs = {}
 
-    attention_cfg: dict = {"backend": args.attention_backend}
+    attention_cfg: dict = {
+        "backend": args.attention_backend,
+        "context_quantization_mode": args.context_quantization_mode,
+    }
     if args.enable_sage_attention:
         attention_cfg["sage_attention_config"] = {
             "num_elts_per_blk_q": 1,
@@ -451,6 +457,7 @@ def main():
                     "model_path": args.model_path,
                     "linear_type": args.linear_type,
                     "attention_backend": args.attention_backend,
+                    "context_quantization_mode": args.context_quantization_mode,
                     "height": args.height,
                     "width": args.width,
                     "steps": args.steps,

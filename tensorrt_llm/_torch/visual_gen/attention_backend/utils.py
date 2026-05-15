@@ -123,6 +123,8 @@ def create_attention(
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
+    elif attention_config is not None:
+        kwargs["context_quantization_mode"] = attention_config.context_quantization_mode
 
     return attn_cls(
         layer_idx=layer_idx,

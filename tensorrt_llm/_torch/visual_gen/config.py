@@ -100,14 +100,40 @@ class AttentionConfig(StrictBaseModel):
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
-    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
-        None,
-        description=(
-            "SageAttention config (TRTLLM backend only). "
-            "Set to a SageAttentionConfig instance to enable SageAttention; "
-            "leave as None to disable."
-        ),
+    context_quantization_mode: Literal["NO_QUANT", "QK16PV8", "SAGE"] = PydanticField(
+        "NO_QUANT", description="Qunatization mode for context (DiT) attention layers"
     )
+    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
+        None, description="SageAttention config (TRTLLM backend only). "
+    )
+
+    @model_validator(mode="after")
+    def _validate_context_quantization_for_backend_support(self) -> "AttentionConfig":
+        if self.context_quantization_mode in ["QK16PV8"]:
+            if self.backend not in ["FA4"]:
+                logger.critical(
+                    f"context_quantization_mode={self.context_quantization_mode} requires "
+                    f"backend=FA4. Found backend={self.backend}. Disabling quantization."
+                )
+                self.context_quantization_mode = "NO_QUANT"
+
+        if self.context_quantization_mode in ["SAGE"]:
+            if self.backend not in ["TRTLLM"]:
+                logger.critical(
+                    f"sage_attention_config requires backend='TRTLLM', "
+                    f"got backend='{self.backend}'. Either set backend='TRTLLM' "
+                    f"or remove sage_attention_config. Disabling SageAttention."
+                )
+                self.context_quantization_mode = "NO_QUANT"
+        else:
+            if self.sage_attention_config is not None:
+                logger.critical(
+                    f"context_quantization_mode is set to {self.context_quantization_mode}, "
+                    f"which will not respect sage_attention_config. Setting to None."
+                )
+                self.sage_attention_config = None
+
+        return self
 
     @model_validator(mode="after")
     def _validate_sage_attn_config(self) -> "AttentionConfig":
@@ -119,16 +145,7 @@ class AttentionConfig(StrictBaseModel):
             (1, 16, 1, True),
         }
 
-        if self.sage_attention_config is not None:
-            if self.backend != "TRTLLM":
-                logger.critical(
-                    f"sage_attention_config requires backend='TRTLLM', "
-                    f"got backend='{self.backend}'. Either set backend='TRTLLM' "
-                    f"or remove sage_attention_config. Disabling SageAttention."
-                )
-                self.sage_attention_config = None
-                return self
-
+        if self.context_quantization_mode in ["SAGE"]:
             if (
                 self.sage_attention_config.num_elts_per_blk_q,
                 self.sage_attention_config.num_elts_per_blk_k,
@@ -139,7 +156,7 @@ class AttentionConfig(StrictBaseModel):
                     f"Unsupported {self.sage_attention_config=}. Disabling SageAttention."
                 )
                 self.sage_attention_config = None
-        return self
+                self.context_quantization_mode = "NO_QUANT"
 
 
 class ParallelConfig(StrictBaseModel):
