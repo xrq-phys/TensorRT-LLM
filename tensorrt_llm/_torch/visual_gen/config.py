@@ -97,8 +97,9 @@ class SageAttentionConfig(StrictBaseModel):
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
-        "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = PydanticField(
+        "VANILLA",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
     )
     context_quantization_mode: Literal["NO_QUANT", "QK16PV8", "SAGE"] = PydanticField(
         "NO_QUANT", description="Qunatization mode for context (DiT) attention layers"
@@ -110,10 +111,10 @@ class AttentionConfig(StrictBaseModel):
     @model_validator(mode="after")
     def _validate_context_quantization_for_backend_support(self) -> "AttentionConfig":
         if self.context_quantization_mode in ["QK16PV8"]:
-            if self.backend not in ["FA4"]:
+            if self.backend not in ["CUTEDSL"]:
                 logger.critical(
                     f"context_quantization_mode={self.context_quantization_mode} requires "
-                    f"backend=FA4. Found backend={self.backend}. Disabling quantization."
+                    f"backend=CUTEDSL. Found backend={self.backend}. Disabling quantization."
                 )
                 self.context_quantization_mode = "NO_QUANT"
 

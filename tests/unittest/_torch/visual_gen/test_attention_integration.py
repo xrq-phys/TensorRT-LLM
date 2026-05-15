@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Test WAN Attention Integration.
 
@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
 _flash_attn4_available = _fa4_fwd is not None
+_cute_dsl_available = _cute_dsl_import_error is None
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -145,6 +147,18 @@ def create_model_config(
     return config
 
 
+def _require_attention_backend(attn_backend: str) -> None:
+    if attn_backend == "FA4" and not _flash_attn4_available:
+        pytest.fail("FlashAttention 4 backend is required for FA4 attention test")
+    if attn_backend == "CUTEDSL" and not _cute_dsl_available:
+        pytest.fail("CuTe DSL backend is required for CUTEDSL attention test")
+    if attn_backend == "CUTEDSL":
+        compute_capability = torch.cuda.get_device_capability()
+        gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+        if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+            pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
+
+
 def copy_weights_self_attention(naive: NaiveWanSelfAttention, integrated: Attention):
     """Copy weights from naive to integrated self-attention."""
     # QKV projection: naive has to_qkv, integrated has qkv_proj
@@ -222,13 +236,13 @@ def generate_rope_embeddings(
         ("VANILLA", "NO_QUANT"),
         ("TRTLLM", "NO_QUANT"),
         ("FA4", "NO_QUANT"),
-        ("FA4", "QK16PV8"),
+        ("CUTEDSL", "NO_QUANT"),
+        ("CUTEDSL", "QK16PV8"),
     ],
 )
 def test_self_attention_equivalence(attn_backend: str, context_quantization_mode: str):
     """Test that integrated self-attention produces same output as naive."""
-    if attn_backend == "FA4" and not _flash_attn4_available:
-        pytest.fail("FlashAttention 4 backend is required for FA4 self-attention test")
+    _require_attention_backend(attn_backend)
 
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
@@ -409,13 +423,13 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     [
         ("VANILLA", "NO_QUANT"),
         ("FA4", "NO_QUANT"),
-        ("FA4", "QK16PV8"),
+        ("CUTEDSL", "NO_QUANT"),
+        ("CUTEDSL", "QK16PV8"),
     ],
 )
 def test_cross_attention_equivalence(attn_backend: str, context_quantization_mode: str):
     """Test that integrated cross-attention produces same output as naive."""
-    if attn_backend == "FA4" and not _flash_attn4_available:
-        pytest.fail("FlashAttention 4 backend is required for FA4 cross-attention test")
+    _require_attention_backend(attn_backend)
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -498,18 +512,25 @@ def test_cross_attention_equivalence(attn_backend: str, context_quantization_mod
         (1, 2048, 512, 12, 128),
     ],
 )
-@pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT", "QK16PV8"])
-def test_fa4_cross_attention_wan_shapes(
+@pytest.mark.parametrize(
+    ("attn_backend", "context_quantization_mode"),
+    [
+        ("FA4", "NO_QUANT"),
+        ("CUTEDSL", "NO_QUANT"),
+        ("CUTEDSL", "QK16PV8"),
+    ],
+)
+def test_fast_cross_attention_wan_shapes(
     batch: int,
     seq_len_q: int,
     seq_len_kv: int,
     num_heads: int,
     head_dim: int,
+    attn_backend: str,
     context_quantization_mode: str,
 ):
-    """Test FA4 cross-attention correctness at Wan-realistic shapes."""
-    if not _flash_attn4_available:
-        pytest.fail("FlashAttention 4 backend is required for FA4 Wan-shape tests")
+    """Test fast cross-attention correctness at Wan-realistic shapes."""
+    _require_attention_backend(attn_backend)
 
     hidden_size = num_heads * head_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -526,21 +547,21 @@ def test_fa4_cross_attention_wan_shapes(
         device
     )
 
-    cfg_fa4 = create_model_config(
+    cfg_fast = create_model_config(
         hidden_size,
         num_heads,
         head_dim,
-        attn_backend="FA4",
+        attn_backend=attn_backend,
         context_quantization_mode=context_quantization_mode,
     )
-    fa4_model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg_fa4).to(
-        device
-    )
+    fast_model = Attention(
+        hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg_fast
+    ).to(device)
 
     copy_weights_cross_attention(naive, ref)
-    copy_weights_cross_attention(naive, fa4_model)
+    copy_weights_cross_attention(naive, fast_model)
     ref.eval()
-    fa4_model.eval()
+    fast_model.eval()
 
     torch.manual_seed(42)
     hidden_states = torch.randn(batch, seq_len_q, hidden_size, device=device, dtype=dtype)
@@ -548,12 +569,12 @@ def test_fa4_cross_attention_wan_shapes(
 
     with torch.no_grad():
         out_ref = ref(hidden_states, encoder_hidden_states)
-        out_fa4 = fa4_model(hidden_states, encoder_hidden_states)
+        out_fast = fast_model(hidden_states, encoder_hidden_states)
 
-    max_diff = (out_ref - out_fa4).abs().max().item()
-    is_close = torch.allclose(out_ref, out_fa4, rtol=1e-2, atol=1e-2)
+    max_diff = (out_ref - out_fast).abs().max().item()
+    is_close = torch.allclose(out_ref, out_fast, rtol=1e-2, atol=1e-2)
     print(f"  Max diff: {max_diff:.2e}, match: {is_close}")
-    assert is_close, f"FA4 cross-attn mismatch at Wan shapes: max_diff={max_diff:.2e}"
+    assert is_close, f"{attn_backend} cross-attn mismatch at Wan shapes: max_diff={max_diff:.2e}"
 
 
 def test_trtllm_cached_prepare():
@@ -729,7 +750,10 @@ def run_all_tests():
     results = {}
 
     # Run self-attention tests with different backends
-    for backend in ["VANILLA", "TRTLLM"] + (["FA4"] if _flash_attn4_available else []):
+    fast_backends = ["FA4"] if _flash_attn4_available else []
+    if _cute_dsl_available:
+        fast_backends.append("CUTEDSL")
+    for backend in ["VANILLA", "TRTLLM"] + fast_backends:
         results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend, "NO_QUANT")
 
     # Run SageAttention self-attention tests (subset for manual runner)
@@ -745,6 +769,8 @@ def run_all_tests():
     results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA", "NO_QUANT")
     if _flash_attn4_available:
         results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4", "NO_QUANT")
+    if _cute_dsl_available:
+        results["cross_attention_CUTEDSL"] = test_cross_attention_equivalence("CUTEDSL", "NO_QUANT")
 
     # Run TRTLLM-specific caching tests
     results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()

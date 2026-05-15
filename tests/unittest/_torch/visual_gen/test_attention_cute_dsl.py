@@ -17,22 +17,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.jit_kernels.cute_precompiled import (
-    cute_dsl_fmha_context_forward,
-    get_cute_dsl_fmha_kernel,
+from tensorrt_llm._torch.visual_gen.jit_kernels.cute_dsl import (
+    cute_dsl_fmha_fwd,
+    get_cute_dsl_fmha_cubin,
 )
 
 
-def test_cute_precompiled_kernel_can_import_and_load() -> None:
+def test_cute_dsl_cubin_kernel_can_import_and_load() -> None:
     try:
-        kernel = get_cute_dsl_fmha_kernel(
+        kernel = get_cute_dsl_fmha_cubin(
             torch.bfloat16,
-            torch.float8_e4m3fn,
+            torch.bfloat16,
             torch.bfloat16,
             128,
-            is_causal=True,
-            is_persistent=False,
-            varlen=True,
+            is_causal=False,
+            is_persistent=True,
+            varlen=False,
             enable_tvm_ffi=True,
             gpu_arch="sm_100a",
         )
@@ -40,6 +40,18 @@ def test_cute_precompiled_kernel_can_import_and_load() -> None:
         pytest.skip(str(exc))
 
     assert kernel is not None
+
+
+def _require_supported_gpu_arch() -> str:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CuTe DSL FMHA kernels.")
+
+    compute_capability = torch.cuda.get_device_capability()
+    gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+    if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+        pytest.skip("CuTe DSL FMHA smoke tests require a supported Blackwell-class GPU.")
+
+    return gpu_arch
 
 
 def _make_indptr(lens: list[int], device: torch.device) -> torch.Tensor:
@@ -151,7 +163,7 @@ def _sdpa_ref(
     ],
 )
 @pytest.mark.parametrize("head_dim", [128])
-def test_cute_dsl_fmha_context_forward_smoke(
+def test_cute_dsl_fmha_context_forward_cubin_smoke(
     q_lens: list[int],
     kv_lens: list[int],
     is_causal: bool,
@@ -164,13 +176,7 @@ def test_cute_dsl_fmha_context_forward_smoke(
     atol: float,
     rtol: float,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for CuTe DSL FMHA precompiled kernels.")
-
-    compute_capability = torch.cuda.get_device_capability()
-    if compute_capability[0] != 10:
-        pytest.skip("CuTe DSL FMHA precompiled smoke test requires an SM100-class GPU.")
-
+    gpu_arch = _require_supported_gpu_arch()
     device = torch.device("cuda:0")
     sm_scale = head_dim**-0.5
     scale_v = 0.06 if pv_dtype == torch.float8_e4m3fn else 1.0
@@ -201,8 +207,19 @@ def test_cute_dsl_fmha_context_forward_smoke(
         device=device,
     )
     out = out_storage[max_qo_len:]
+    kernel_fn = get_cute_dsl_fmha_cubin(
+        qk_dtype,
+        pv_dtype,
+        out_dtype,
+        head_dim,
+        is_causal,
+        is_persistent=True,
+        varlen=False,
+        enable_tvm_ffi=True,
+        gpu_arch=gpu_arch,
+    )
 
-    cute_dsl_fmha_context_forward(
+    cute_dsl_fmha_fwd(
         q,
         k,
         v,
@@ -214,6 +231,7 @@ def test_cute_dsl_fmha_context_forward_smoke(
         scale_v=scale_v,
         max_qo_len=max_qo_len,
         max_kv_len=max_kv_len,
+        kernel_fn=kernel_fn,
     )
     torch.cuda.synchronize()
 
@@ -227,3 +245,69 @@ def test_cute_dsl_fmha_context_forward_smoke(
         sm_scale,
     )
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_cute_dsl_fmha_context_forward_jit_smoke(
+    is_causal: bool,
+    dtype: torch.dtype,
+) -> None:
+    _require_supported_gpu_arch()
+    device = torch.device("cuda:0")
+    q_lens = [128]
+    kv_lens = [128]
+    num_heads = 2
+    num_heads_kv = 2
+    head_dim = 128
+    sm_scale = head_dim**-0.5
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    qo_indptr = _make_indptr(q_lens, device)
+    kv_indptr = _make_indptr(kv_lens, device)
+    total_q = int(qo_indptr[-1].item())
+    total_kv = int(kv_indptr[-1].item())
+    max_qo_len = max(q_lens)
+    max_kv_len = max(kv_lens)
+
+    q, q_ref = _make_tensor(max_qo_len, total_q, num_heads, head_dim, dtype, dtype, 1.0, device)
+    k, k_ref = _make_tensor(max_kv_len, total_kv, num_heads_kv, head_dim, dtype, dtype, 1.0, device)
+    v, v_ref = _make_tensor(max_kv_len, total_kv, num_heads_kv, head_dim, dtype, dtype, 1.0, device)
+    out_storage = torch.empty(
+        max_qo_len + total_q,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    out = out_storage[max_qo_len:]
+
+    try:
+        cute_dsl_fmha_fwd(
+            q,
+            k,
+            v,
+            out,
+            qo_indptr,
+            kv_indptr,
+            is_causal=is_causal,
+            sm_scale=sm_scale,
+            allow_cubins=False,
+            max_qo_len=max_qo_len,
+            max_kv_len=max_kv_len,
+        )
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    torch.cuda.synchronize()
+
+    out_ref = _sdpa_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        qo_indptr,
+        kv_indptr,
+        is_causal,
+        sm_scale,
+    )
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)

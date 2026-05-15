@@ -13,14 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Flash Attention 4 Backend for Visual Generation Models
+CuTe DSL (NVIDIA kernels) Backend for Visual Generation Models
 
-Uses Flash Attention 4 with the CUTE JIT kernel.
+Uses CUTE DSL JIT kernel published in CUTLASS, or its pre-compiled derivatives.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 
-Cute kernel source: tensorrt_llm/_torch/visual_gen/jit_kernels/flash_attention/cute/
-(https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute
-at commit ea8f73506369d7cdd498396474107a978858138c)
+Cute kernel source: tensorrt_llm/_torch/visual_gen/jit_kernels/cute_dsl
+(https://github.com/nvidia/cutlass at commit e406c186f510a15091cce01f782020ceb7ba8eb5)
 """
 
 import math
@@ -31,24 +30,24 @@ import torch
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
-_flash_attn_fwd_import_error = None
+_cute_dsl_import_error = None
 try:
-    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
-        _flash_attn_fwd,
-    )
+    from tensorrt_llm._torch.visual_gen.jit_kernels import cute_dsl
+    from tensorrt_llm._torch.visual_gen.jit_kernels.cute_dsl.fmha import _cute_runtime_import_error
+
+    if _cute_runtime_import_error is not None:
+        raise ImportError(_cute_runtime_import_error)
 except (ImportError, OSError) as e:
-    _flash_attn_fwd = None
-    _flash_attn_fwd_import_error = e
+    cute_dsl = None
+    _cute_dsl_import_error = e
 
 
-class FlashAttn4Attention(AttentionBackend):
+class CuTeDSLAttention(AttentionBackend):
     """
-    Flash Attention 4 backend for diffusion models.
+    CuTe DSL (NVIDIA kernels) backend for diffusion models.
 
-    Uses flash_attn.cute.interface._flash_attn_fwd which:
-    - Expects [B, S, H, D] (NHD) format
-    - Supports float16 and bfloat16 (auto-casts other dtypes)
-    - Supports both self-attention and cross-attention (different Q/KV lengths)
+    Uses pre-compiled cubin kernels when allowed & present.
+    Otherwise compiles the kernels with CuTe DSL JIT.
     """
 
     def __init__(
@@ -58,6 +57,8 @@ class FlashAttn4Attention(AttentionBackend):
         head_dim: int = 64,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        allow_cubins: bool = True,
+        context_quantization_mode: str = "NO_QUANT",
         **kwargs,
     ):
         self.layer_idx = layer_idx
@@ -65,36 +66,12 @@ class FlashAttn4Attention(AttentionBackend):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
+        self.allow_cubins = allow_cubins
+        self.context_quantization_mode = context_quantization_mode
         self.scale = 1.0 / math.sqrt(head_dim)
 
-        # FA4 expects [B, S, H, D] format
+        # CuTe DSL expects [B, S, H, D] format
         self._preferred_layout = AttentionTensorLayout.NHD
-
-    @torch.compiler.disable
-    def _fwd(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        causal: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
-        output, lse = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            softmax_scale=self.scale,
-            causal=causal,
-            window_size_left=None,
-            window_size_right=None,
-            learnable_sink=None,
-            softcap=0.0,
-            pack_gqa=None,
-            mask_mod=None,
-            block_sparse_tensors=None,
-            return_lse=True,
-        )
-        return output, lse
 
     def _prepare_inputs(
         self,
@@ -103,21 +80,76 @@ class FlashAttn4Attention(AttentionBackend):
         v: torch.Tensor,
         attention_mask: PredefinedAttentionMask,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype]:
-        """Cast inputs to FA4-compatible dtype and resolve causal flag."""
-        if _flash_attn_fwd is None:
+        """Cast inputs to CuTeDSL-compatible dtype and resolve causal flag."""
+        if _cute_dsl_import_error is not None:
             raise ImportError(
-                f"FlashAttention 4 is not available. Import error: {_flash_attn_fwd_import_error}"
-            ) from _flash_attn_fwd_import_error
+                f"CuTe DSL kernels are not available. Import error: {_cute_dsl_import_error}"
+            ) from _cute_dsl_import_error
 
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 
-        # FA4 only supports float16 and bfloat16
+        # The JIT source code only supports float16 and bfloat16
         origin_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
         return q, k, v, is_causal, origin_dtype
+
+    # cute_dsl.cute_dsl_fmha_fwd is already decorated with @torch.compiler.disable
+    # Allow torch.compile to fuse preceding linear/norm with quantization of V / seq-preprocess
+    def _fwd(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        is_causal: bool,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len_q, num_heads, _ = q.shape
+        _, seq_len_kv, _, value_head_dim = v.shape
+        out = torch.empty(
+            batch_size,
+            seq_len_q,
+            num_heads,
+            value_head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        lse = torch.empty(
+            batch_size,
+            num_heads,
+            seq_len_q,
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        # Options that instructs quantization of V
+        scale_v = kwargs.get("scale_v", 1.0)
+        if self.context_quantization_mode in ["QK16PV8"]:
+            v_qscale = 448.0 / v.abs().amax()
+            v = (v * v_qscale).to(torch.float8_e4m3fn)
+            scale_v = scale_v / float(v_qscale.item())
+
+        cute_dsl.cute_dsl_fmha_fwd(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            out,
+            is_causal=is_causal,
+            sm_scale=self.scale,
+            lse=lse,
+            scale_q=kwargs.get("scale_q", 1.0),
+            scale_k=kwargs.get("scale_k", 1.0),
+            scale_v=scale_v,
+            scale_o=kwargs.get("scale_o", 1.0),
+            max_qo_len=seq_len_q,
+            max_kv_len=seq_len_kv,
+            is_persistent=True,
+            allow_cubins=self.allow_cubins,
+            skip_softmax_threshold_scale_factor=kwargs.get("skip_softmax_threshold_scale_factor"),
+        )
+        return out, lse
 
     def forward(
         self,
@@ -129,7 +161,7 @@ class FlashAttn4Attention(AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """
-        Forward pass using Flash Attention 4.
+        Forward pass using CuTe DSL (NVIDIA kernels).
 
         Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
 
@@ -158,12 +190,12 @@ class FlashAttn4Attention(AttentionBackend):
 
         Returns:
             output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] — log-sum-exp per query position,
+            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
-        output, lse = self._fwd(q, k, v, is_causal)
+        output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse

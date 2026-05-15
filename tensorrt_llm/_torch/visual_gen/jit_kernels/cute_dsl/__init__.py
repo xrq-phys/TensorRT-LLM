@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fmha import cute_dsl_fmha_context_forward, get_cute_dsl_fmha_kernel
+from .fmha import cute_dsl_fmha_fwd, get_cute_dsl_fmha_cubin, launch_cute_dsl_jit_fmha
 
-__all__ = ["cute_dsl_fmha_context_forward", "get_cute_dsl_fmha_kernel"]
+__all__ = ["cute_dsl_fmha_fwd", "get_cute_dsl_fmha_cubin", "launch_cute_dsl_jit_fmha"]

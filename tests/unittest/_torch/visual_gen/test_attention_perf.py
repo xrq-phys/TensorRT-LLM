@@ -39,6 +39,7 @@ import torch
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
@@ -52,6 +53,28 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 
 _flash_attn4_available = _fa4_fwd is not None
+_cute_dsl_available = _cute_dsl_import_error is None
+
+
+def _require_attention_backend(backend: str) -> None:
+    if backend == "FA4" and not _flash_attn4_available:
+        pytest.fail(
+            "FlashAttention 4 backend is required for FA4 attention perf test"
+            + (f": {_fa4_import_error}" if _fa4_import_error else "")
+        )
+    if backend == "CUTEDSL" and not _cute_dsl_available:
+        pytest.fail(
+            "CuTe DSL backend is required for CUTEDSL attention perf test"
+            + (f": {_cute_dsl_import_error}" if _cute_dsl_import_error else "")
+        )
+    if backend == "CUTEDSL":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required for CUTEDSL attention perf test")
+        compute_capability = torch.cuda.get_device_capability()
+        gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+        if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+            pytest.skip("CUTEDSL attention perf test requires a supported Blackwell-class GPU")
+
 
 # NVTX support for profiling
 try:
@@ -685,16 +708,13 @@ class TestWanAttentionPerformance:
             ("VANILLA", "NO_QUANT"),
             ("TRTLLM", "NO_QUANT"),
             ("FA4", "NO_QUANT"),
-            ("FA4", "QK16PV8"),
+            ("CUTEDSL", "NO_QUANT"),
+            ("CUTEDSL", "QK16PV8"),
         ],
     )
     def test_self_attention_perf(self, backend: str, context_quantization_mode: str):
         """Test that attention backend runs without errors."""
-        if backend == "FA4" and not _flash_attn4_available:
-            pytest.fail(
-                "FlashAttention 4 backend is required for FA4 self-attention perf test"
-                + (f": {_fa4_import_error}" if _fa4_import_error else "")
-            )
+        _require_attention_backend(backend)
 
         batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 64
 
@@ -780,7 +800,7 @@ class TestFlashAttn4Performance:
             ("wan_14b_720p_81f", 1, 75600, 40, 128),  # 720x1280x81f
         ],
     )
-    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT", "QK16PV8"])
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_vs_vanilla_wan_shapes(
         self,
         model_name: str,
@@ -854,7 +874,7 @@ class TestFlashAttn4CrossAttnPerformance:
             ("wan_14b_720p_81f_cross", 1, 75600, 512, 40, 128),
         ],
     )
-    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT", "QK16PV8"])
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_vs_vanilla_cross_attn_wan_shapes(
         self,
         model_name: str,
@@ -901,7 +921,7 @@ class TestFlashAttn4CrossAttnPerformance:
             (2, 1024, 512, 12, 128),
         ],
     )
-    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT", "QK16PV8"])
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_cross_attn_quick(
         self,
         batch: int,

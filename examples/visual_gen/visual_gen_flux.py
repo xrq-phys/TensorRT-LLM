@@ -209,9 +209,9 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM", "FA4"],
+        choices=["VANILLA", "TRTLLM", "FA4", "CUTEDSL"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
-        "FA4: Flash Attention 4). "
+        "FA4: Flash Attention 4, CUTEDSL: CuTe DSL kernels). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
     parser.add_argument(
@@ -219,7 +219,7 @@ def parse_args():
         type=str,
         default="NO_QUANT",
         choices=["NO_QUANT", "QK16PV8", "SAGE"],
-        help="Context attention quantization mode. QK16PV8 requires --attention_backend FA4. "
+        help="Context attention quantization mode. QK16PV8 requires --attention_backend CUTEDSL. "
         "SAGE requires --attention_backend TRTLLM.",
     )
 
