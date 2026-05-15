@@ -118,8 +118,8 @@ class CuTeDSLAttention(AttentionBackend):
         )
         lse = torch.empty(
             batch_size,
-            num_heads,
             seq_len_q,
+            num_heads,
             dtype=torch.float32,
             device=q.device,
         )
@@ -131,21 +131,29 @@ class CuTeDSLAttention(AttentionBackend):
             v = (v * v_qscale).to(torch.float8_e4m3fn)
             scale_v = scale_v / float(v_qscale.item())
 
+        # Sequence preproc.
+        qo_indptr_host = [i * seq_len_q for i in range(batch_size + 1)]
+        qo_indptr = torch.tensor(qo_indptr_host).to(device=q.device, dtype=torch.int32)
+        kv_indptr_host = [i * seq_len_kv for i in range(batch_size + 1)]
+        kv_indptr = torch.tensor(kv_indptr_host).to(device=q.device, dtype=torch.int32)
+
         cute_dsl.cute_dsl_fmha_fwd(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            out,
+            q.flatten(0, 1).contiguous(),
+            k.flatten(0, 1).contiguous(),
+            v.flatten(0, 1).contiguous(),
+            out.flatten(0, 1),
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
             is_causal=is_causal,
             sm_scale=self.scale,
-            lse=lse,
+            lse=lse.flatten(0, 1).contiguous(),
             scale_q=kwargs.get("scale_q", 1.0),
             scale_k=kwargs.get("scale_k", 1.0),
             scale_v=scale_v,
             scale_o=kwargs.get("scale_o", 1.0),
             max_qo_len=seq_len_q,
             max_kv_len=seq_len_kv,
-            is_persistent=True,
+            is_persistent=False,
             allow_cubins=self.allow_cubins,
             skip_softmax_threshold_scale_factor=kwargs.get("skip_softmax_threshold_scale_factor"),
         )
@@ -198,7 +206,7 @@ class CuTeDSLAttention(AttentionBackend):
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
-        return output, lse
+        return output, lse.transpose(1, 2)
 
     @classmethod
     def support_lse(cls) -> bool:

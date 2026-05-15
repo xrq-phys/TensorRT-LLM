@@ -39,7 +39,7 @@ except (ImportError, OSError) as e:
 
 
 CUBINS_ROOT = Path(__file__).resolve().parent / "cubins"
-SUPPORTED_GPU_ARCHS = ("sm_100a", "sm_103a", "sm_110a")
+SUPPORTED_GPU_ARCHS = ("sm_100a", "sm_103a")
 _JIT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
@@ -271,6 +271,7 @@ def _get_runtime_problem(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
+    lse: Optional[torch.Tensor],
     qo_indptr: Optional[torch.Tensor],
     kv_indptr: Optional[torch.Tensor],
     max_qo_len: Optional[int],
@@ -306,6 +307,7 @@ def _get_runtime_problem(
         k_4d = k.unsqueeze(0)
         v_4d = v.unsqueeze(0)
         o_4d = o.unsqueeze(0)
+        lse_3d = lse.unsqueeze(0) if lse is not None else None
     else:
         batch_size, max_s_q, num_heads_q, head_dim = q.shape
         _, max_s_k, num_heads_kv, _ = k.shape
@@ -314,6 +316,7 @@ def _get_runtime_problem(
         k_4d = k
         v_4d = v
         o_4d = o
+        lse_3d = lse
     value_head_dim = v.shape[-1]
     return (
         batch_size,
@@ -328,6 +331,7 @@ def _get_runtime_problem(
         k_4d,
         v_4d,
         o_4d,
+        lse_3d,
     )
 
 
@@ -568,7 +572,8 @@ def cute_dsl_fmha_fwd(
         k_4d,
         v_4d,
         o_4d,
-    ) = _get_runtime_problem(q, k, v, o, qo_indptr, kv_indptr, max_qo_len, max_kv_len, varlen)
+        lse_3d,
+    ) = _get_runtime_problem(q, k, v, o, lse, qo_indptr, kv_indptr, max_qo_len, max_kv_len, varlen)
     use_skip_softmax = (
         skip_softmax_threshold_scale_factor is not None and skip_softmax_threshold_scale_factor > 0
     )
@@ -631,7 +636,7 @@ def cute_dsl_fmha_fwd(
             problem_size,
             qo_indptr if varlen else None,
             kv_indptr if varlen else None,
-            lse,
+            lse_3d,
             is_causal,
             sm_scale,
             window_left,
@@ -647,19 +652,26 @@ def cute_dsl_fmha_fwd(
         return
 
     # CUBIN path
+    num_head_groups = num_heads_q // num_heads_kv
+    q_5d = q_4d.unflatten(2, (num_heads_kv, num_head_groups))
+    k_5d = k_4d.unsqueeze(3)
+    v_5d = v_4d.unsqueeze(3)
+    o_5d = o_4d.unflatten(2, (num_heads_kv, num_head_groups))
+    lse_4d = lse_3d.unflatten(2, (num_heads_kv, num_head_groups)) if lse is not None else None
 
     if enable_tvm_ffi:
         qo_indptr_i32 = _to_cint_contiguous(qo_indptr) if varlen else None
         kv_indptr_i32 = _to_cint_contiguous(kv_indptr) if varlen else None
         kernel_fn(
-            q_4d.data_ptr(),
-            k_4d.data_ptr(),
-            v_4d.data_ptr(),
-            o_4d.data_ptr(),
+            q_5d,
+            k_5d,
+            v_5d,
+            o_5d,
             problem_size,
             qo_indptr_i32,
             kv_indptr_i32,
-            lse.data_ptr() if lse is not None else None,
+            lse_4d,
+            None, # sink
             cute_typing.Float32(scale_softmax_log2),
             cute_typing.Float32(scale_softmax),
             cute_typing.Float32(scale_output),
@@ -668,14 +680,14 @@ def cute_dsl_fmha_fwd(
             ws_right,
             None,
             None,
-            q_4d,
+            False, # reserved
         )
         return
 
-    q_cute = _to_cute_tensor(q_4d, leading_dim=3)
-    k_cute = _to_cute_tensor(k_4d, leading_dim=3)
-    v_cute = _to_cute_tensor(v_4d, leading_dim=3)
-    o_cute = _to_cute_tensor(o_4d, leading_dim=3)
+    q_cute = _to_cute_tensor(q_5d, leading_dim=4)
+    k_cute = _to_cute_tensor(k_5d, leading_dim=4)
+    v_cute = _to_cute_tensor(v_5d, leading_dim=4)
+    o_cute = _to_cute_tensor(o_5d, leading_dim=4)
 
     cum_seqlen_q_cute = None
     cum_seqlen_k_cute = None
@@ -691,7 +703,7 @@ def cute_dsl_fmha_fwd(
 
     lse_iter = None
     if lse is not None:
-        lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        lse_cute = from_dlpack(lse_4d, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         lse_iter = lse_cute.iterator
 
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -704,6 +716,7 @@ def cute_dsl_fmha_fwd(
         cum_seqlen_q_cute,
         cum_seqlen_k_cute,
         lse_iter,
+        None, # sink_iter
         cute_typing.Float32(scale_softmax_log2),
         cute_typing.Float32(scale_softmax),
         cute_typing.Float32(scale_output),
@@ -712,6 +725,6 @@ def cute_dsl_fmha_fwd(
         ws_right,
         None,
         None,
-        None,
+        False, # reserved
         stream,
     )

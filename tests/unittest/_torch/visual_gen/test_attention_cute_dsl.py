@@ -31,8 +31,8 @@ def test_cute_dsl_cubin_kernel_can_import_and_load() -> None:
             torch.bfloat16,
             128,
             is_causal=False,
-            is_persistent=True,
-            varlen=False,
+            is_persistent=False,
+            varlen=True,
             enable_tvm_ffi=True,
             gpu_arch="sm_100a",
         )
@@ -48,7 +48,7 @@ def _require_supported_gpu_arch() -> str:
 
     compute_capability = torch.cuda.get_device_capability()
     gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-    if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+    if gpu_arch not in ("sm_100a", "sm_103a"):
         pytest.skip("CuTe DSL FMHA smoke tests require a supported Blackwell-class GPU.")
 
     return gpu_arch
@@ -213,8 +213,8 @@ def test_cute_dsl_fmha_context_forward_cubin_smoke(
         out_dtype,
         head_dim,
         is_causal,
-        is_persistent=True,
-        varlen=False,
+        is_persistent=False,
+        varlen=True,
         enable_tvm_ffi=True,
         gpu_arch=gpu_arch,
     )

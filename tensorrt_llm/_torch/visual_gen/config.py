@@ -159,6 +159,8 @@ class AttentionConfig(StrictBaseModel):
                 self.sage_attention_config = None
                 self.context_quantization_mode = "NO_QUANT"
 
+        return self
+
 
 class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism.

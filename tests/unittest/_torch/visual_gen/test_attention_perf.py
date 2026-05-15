@@ -72,7 +72,7 @@ def _require_attention_backend(backend: str) -> None:
             pytest.skip("CUDA is required for CUTEDSL attention perf test")
         compute_capability = torch.cuda.get_device_capability()
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-        if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+        if gpu_arch not in ("sm_100a", "sm_103a"):
             pytest.skip("CUTEDSL attention perf test requires a supported Blackwell-class GPU")
 
 
@@ -716,7 +716,7 @@ class TestWanAttentionPerformance:
         """Test that attention backend runs without errors."""
         _require_attention_backend(backend)
 
-        batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 64
+        batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 128
 
         result = self.benchmark.benchmark_single(
             batch_size,

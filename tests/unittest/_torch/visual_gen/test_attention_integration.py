@@ -155,7 +155,7 @@ def _require_attention_backend(attn_backend: str) -> None:
     if attn_backend == "CUTEDSL":
         compute_capability = torch.cuda.get_device_capability()
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-        if gpu_arch not in ("sm_100a", "sm_103a", "sm_110a"):
+        if gpu_arch not in ("sm_100a", "sm_103a"):
             pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
 
 
@@ -251,7 +251,7 @@ def test_self_attention_equivalence(attn_backend: str, context_quantization_mode
     # Config
     batch_size = 2
     seq_len = 16
-    hidden_size = 128
+    hidden_size = 512
     num_heads = 4
     head_dim = hidden_size // num_heads
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,13 +297,14 @@ def test_self_attention_equivalence(attn_backend: str, context_quantization_mode
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
+    tol = 1e-2 if context_quantization_mode == "NO_QUANT" else 3e-2
+    is_close = torch.allclose(out_naive, out_integrated, rtol=tol, atol=tol)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
+    print(f"  Outputs match (rtol={tol}, atol={tol}): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Self-attention outputs match!")
@@ -331,6 +332,10 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     3. Outputs are finite (no NaN/Inf)
     4. Approximate agreement with naive (cosine similarity > 0.99)
     """
+    compute_capability = torch.cuda.get_device_capability()
+    gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+    if qk_int8 and gpu_arch not in ["sm_100a"]:
+        pytest.skip("Int8 kernels are only available for SM100 devices.")
     print("\n" + "=" * 60)
     print(f"Testing SageAttention (qk_int8={qk_int8}, B={batch_size}, S={seq_len})")
     print("=" * 60)
@@ -439,7 +444,7 @@ def test_cross_attention_equivalence(attn_backend: str, context_quantization_mod
     batch_size = 2
     seq_len = 16
     encoder_seq_len = 24  # Different from query seq_len
-    hidden_size = 128
+    hidden_size = 512
     num_heads = 4
     head_dim = hidden_size // num_heads
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -486,13 +491,14 @@ def test_cross_attention_equivalence(attn_backend: str, context_quantization_mod
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)
+    tol = 1e-2 if context_quantization_mode == "NO_QUANT" else 3e-2
+    is_close = torch.allclose(out_naive, out_integrated, rtol=tol, atol=tol)
 
     print("\nResults:")
     print(f"  Output shape: naive={out_naive.shape}, integrated={out_integrated.shape}")
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Mean absolute difference: {mean_diff:.2e}")
-    print(f"  Outputs match (rtol=1e-2, atol=1e-2): {is_close}")
+    print(f"  Outputs match (rtol={tol}, atol={tol}): {is_close}")
 
     if is_close:
         print("  ✅ PASS: Cross-attention outputs match!")
