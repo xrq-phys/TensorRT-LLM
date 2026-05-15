@@ -94,7 +94,7 @@ python visual_gen_wan_t2v.py \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
-    --enable_sage_attention \
+    --context_quantization_mode SAGE \
     --output_path output.mp4
 ```
 
@@ -114,7 +114,7 @@ WAN supports two parallelism modes that can be combined:
 - **CFG Parallelism**: Split positive/negative prompts across GPUs
 - **Sequence Parallelism**:
   - *Ulysses*: Split sequence along head dimension across GPUs; requires `ulysses_size` to divide the model's head count
-  - *Attention2D*: 2D mesh sequence parallelism; no head-count constraint; requires `--attention_backend FA4`
+  - *Attention2D*: 2D mesh sequence parallelism; no head-count constraint; requires `--attention_backend FA4` or `--attention_backend CUTEDSL`
   - Combining Ulysses and Attention2D is not yet supported
 
 
@@ -284,8 +284,8 @@ python visual_gen_ltx2.py \
 | `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
-| `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
+| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, `FA4`, or `CUTEDSL` |
+| `--context_quantization_mode` | ✓ | ✓ | — | NO_QUANT | `NO_QUANT`, `QK16PV8` (`CUTEDSL` backend only), or `SAGE` (`TRTLLM` backend only) |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
 | `--parallel_vae_size` | - | ✓ | — | 1 | Parallelism used for VAE |
@@ -322,7 +322,7 @@ python visual_gen_ltx2.py \
 - Sequence length must be divisible by `ulysses_size`
 
 **Attention2D Errors:**
-- Requires `--attention_backend FA4`
+- Requires `--attention_backend FA4` or `--attention_backend CUTEDSL`
 - Combining with `--ulysses_size` is not yet supported
 - Total GPUs = `cfg_size × attn2d_row_size × attn2d_col_size`
 - Sequence length must be divisible by `attn2d_row_size × attn2d_col_size`

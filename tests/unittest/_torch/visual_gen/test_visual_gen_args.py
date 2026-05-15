@@ -82,31 +82,48 @@ class TestAttentionConfigSageFallback:
         with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
             attention = AttentionConfig(
                 backend="VANILLA",
+                context_quantization_mode="SAGE",
                 sage_attention_config=SageAttentionConfig(),
             )
 
         assert attention.sage_attention_config is None
-        critical.assert_called_once()
-        assert "requires backend='TRTLLM'" in critical.call_args.args[0]
+        assert attention.context_quantization_mode == "NO_QUANT"
+        critical.assert_called()
 
     def test_sage_config_fallback_when_unsupported(self):
         with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
             attention = AttentionConfig(
                 backend="TRTLLM",
+                context_quantization_mode="SAGE",
                 sage_attention_config=SageAttentionConfig(num_elts_per_blk_q=127),
             )
 
         assert attention.sage_attention_config is None
+        assert attention.context_quantization_mode == "NO_QUANT"
         critical.assert_called_once()
         assert "Unsupported self.sage_attention_config" in critical.call_args.args[0]
 
     def test_supported_sage_configs(self):
         attention = AttentionConfig(
             backend="TRTLLM",
+            context_quantization_mode="SAGE",
             sage_attention_config=SageAttentionConfig(),
         )
 
         assert attention.sage_attention_config is not None
+        assert attention.context_quantization_mode == "SAGE"
+
+    def test_sage_config_fallback_when_not_supplied(self):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                context_quantization_mode="SAGE",
+            )
+
+        assert attention.sage_attention_config is not None
+        assert attention.context_quantization_mode == "SAGE"
+        critical.assert_called_once()
+        assert "SageAttention requested without specific config" in critical.call_args.args[0]
 
 
 class TestVisualGenArgsCacheBackend:

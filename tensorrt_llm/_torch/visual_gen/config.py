@@ -96,48 +96,74 @@ class SageAttentionConfig(StrictBaseModel):
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
-        "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = PydanticField(
+        "VANILLA",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+    )
+    context_quantization_mode: Literal["NO_QUANT", "QK16PV8", "SAGE"] = PydanticField(
+        "NO_QUANT", description="Qunatization mode for context (DiT) attention layers"
     )
     sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
-        None,
-        description=(
-            "SageAttention config (TRTLLM backend only). "
-            "Set to a SageAttentionConfig instance to enable SageAttention; "
-            "leave as None to disable."
-        ),
+        None, description="SageAttention config (TRTLLM backend only). "
     )
 
     @model_validator(mode="after")
-    def _validate_sage_attn_config(self) -> "AttentionConfig":
-        SUPPORTED_SAGE_CONFIGS = {
-            (1, 1, 1, False),
-            (1, 4, 1, False),
-            (1, 1, 1, True),
-            (1, 4, 1, True),
-            (1, 16, 1, True),
-        }
+    def _validate_context_quantization_config(self) -> "AttentionConfig":
+        if self.context_quantization_mode in ["QK16PV8"]:
+            if self.backend not in ["CUTEDSL"]:
+                logger.critical(
+                    f"context_quantization_mode={self.context_quantization_mode} requires "
+                    f"backend=CUTEDSL. Found backend={self.backend}. Disabling quantization."
+                )
+                self.context_quantization_mode = "NO_QUANT"
 
-        if self.sage_attention_config is not None:
-            if self.backend != "TRTLLM":
+        if self.context_quantization_mode in ["SAGE"]:
+            if self.backend not in ["TRTLLM"]:
                 logger.critical(
                     f"sage_attention_config requires backend='TRTLLM', "
                     f"got backend='{self.backend}'. Either set backend='TRTLLM' "
                     f"or remove sage_attention_config. Disabling SageAttention."
                 )
-                self.sage_attention_config = None
-                return self
+                self.context_quantization_mode = "NO_QUANT"
+
+        if self.context_quantization_mode in ["SAGE"]:
+            if self.sage_attention_config is None:
+                logger.critical(
+                    "SageAttention requested without specific config. "
+                    "Using (1, 4, 1) without QKV in FP8."
+                )
+                self.sage_attention_config = SageAttentionConfig(
+                    num_elts_per_blk_q=1,
+                    num_elts_per_blk_k=4,
+                    num_elts_per_blk_v=1,
+                    qk_int8=False,
+                )
 
             if (
                 self.sage_attention_config.num_elts_per_blk_q,
                 self.sage_attention_config.num_elts_per_blk_k,
                 self.sage_attention_config.num_elts_per_blk_v,
                 self.sage_attention_config.qk_int8,
-            ) not in SUPPORTED_SAGE_CONFIGS:
+            ) not in {
+                (1, 1, 1, False),
+                (1, 4, 1, False),
+                (1, 1, 1, True),
+                (1, 4, 1, True),
+                (1, 16, 1, True),
+            }:
                 logger.critical(
                     f"Unsupported {self.sage_attention_config=}. Disabling SageAttention."
                 )
                 self.sage_attention_config = None
+                self.context_quantization_mode = "NO_QUANT"
+        else:
+            if self.sage_attention_config is not None:
+                logger.critical(
+                    f"context_quantization_mode is set to {self.context_quantization_mode}, "
+                    f"which will not respect sage_attention_config. Setting to None."
+                )
+                self.sage_attention_config = None
+
         return self
 
 

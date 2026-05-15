@@ -185,21 +185,18 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM", "FA4"],
+        choices=["VANILLA", "TRTLLM", "FA4", "CUTEDSL"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
-        "FA4: Flash Attention 4). "
+        "FA4: Flash Attention 4, CUTEDSL: CuTe DSL kernels). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
-
-    # SageAttention (requires --attention_backend TRTLLM)
     parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help=(
-            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
-            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.x 1.3B, "
-            "(1, 16, 1) otherwise."
-        ),
+        "--context_quantization_mode",
+        type=str,
+        default="NO_QUANT",
+        choices=["NO_QUANT", "QK16PV8", "SAGE"],
+        help="Context attention quantization mode. QK16PV8 requires --attention_backend CUTEDSL. "
+        "SAGE requires --attention_backend TRTLLM.",
     )
 
     # Parallelism
@@ -359,8 +356,9 @@ def main():
 
     attention_cfg = {
         "backend": args.attention_backend,
+        "context_quantization_mode": args.context_quantization_mode,
     }
-    if args.enable_sage_attention:
+    if args.context_quantization_mode == "SAGE":
         num_elts_per_blk_k = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16
         sage_cfg = {
             "num_elts_per_blk_q": 1,
