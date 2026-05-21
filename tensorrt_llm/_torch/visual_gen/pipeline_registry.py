@@ -102,6 +102,9 @@ class AutoPipeline:
             if "Flux" in class_name:
                 return "FluxPipeline"
 
+            if "Cosmos3" in class_name:
+                return "Cosmos3OmniMoTPipeline"
+
         #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)
         #########################################################

@@ -114,6 +114,7 @@ class LTX2Attention(Attention):
             bias=True,
             config=config,
             layer_idx=layer_idx,
+            enable_ulysses=use_ulysses and not self._is_cross_attn,
         )
 
         # For audio self-attention that may need a runtime Ulysses toggle
