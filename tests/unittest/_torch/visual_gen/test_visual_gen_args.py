@@ -107,6 +107,22 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    def test_supported_quant_config_cudnn(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=1,
+                k_block_size=1,
+                v_block_size=1,
+                qk_sf_vec=32,
+                v_sf_vec=32,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
 
 class TestPipelineRegistryUnique:
     """Guard against duplicate HF IDs across PIPELINE_REGISTRY entries.

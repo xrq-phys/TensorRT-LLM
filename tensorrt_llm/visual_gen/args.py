@@ -44,7 +44,7 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / CUTEDSL / CUDNN backends).
 
     Describes user intent for quantized attention: per-bmm dtype and per-block layout for Q, K, V.
     Providing this config to AttentionConfig enables quantized attention; setting
@@ -80,7 +80,26 @@ class QuantAttentionConfig(StrictBaseModel):
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for V; 0 for per-tensor quantization.",
+        description="Elements per channel block for V; 0 for per-tensor quantization.",
+    )
+    qk_sf_vec: int = Field(
+        0,
+        ge=0,
+        status="prototype",
+        description=(
+            "Scale-factor vector size for block-scaled Q@K. "
+            "0 disables the block-scaled path (QK16PV8 / dense). "
+            "32 selects MXFP8 (requires qk_dtype=='fp8' and CUDNN backend)."
+        ),
+    )
+    v_sf_vec: int = Field(
+        0,
+        ge=0,
+        status="prototype",
+        description=(
+            "Scale-factor vector size for block-scaled P@V. "
+            "0 disables; 32 selects MXFP8 (requires v_dtype=='fp8' and CUDNN backend)."
+        ),
     )
 
 
@@ -94,16 +113,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL", "CUDNN"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL, CUDNN",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / CUTEDSL / CUDNN backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -124,17 +143,23 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        # Recipe tuple:
+        # (qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec, v_sf_vec).
+        # SAGE recipes target the TRTLLM backend; SF vector knobs are always 0.
         SAGE_RECIPES = {
-            ("int8", "fp8", (1, 1, 1)),
-            ("int8", "fp8", (1, 4, 1)),
-            ("int8", "fp8", (1, 16, 1)),
-            ("fp8", "fp8", (1, 1, 1)),
-            ("fp8", "fp8", (1, 4, 1)),
+            ("int8", "fp8", (1, 1, 1), 0, 0),
+            ("int8", "fp8", (1, 4, 1), 0, 0),
+            ("int8", "fp8", (1, 16, 1), 0, 0),
+            ("fp8", "fp8", (1, 1, 1), 0, 0),
+            ("fp8", "fp8", (1, 4, 1), 0, 0),
         }
-        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
-        QK16PV8_DTYPES = {
-            ("bf16", "fp8", (0, 0, 0)),
+        # QK16PV8 (CUTEDSL dense path): Q/K kept in bf16, V quantized to FP8.
+        CUTEDSL_RECIPES = {
+            ("bf16", "fp8", (0, 0, 0), 0, 0),  # QK16PV8 (dense)
+        }
+        # CUDNN MXFP8: block-scaled FP8 Q/K/V; V scales over sequence for BMM2.
+        CUDNN_RECIPES = {
+            ("fp8", "fp8", (1, 1, 1), 32, 32),  # MXFP8
         }
 
         if self.quant_attention_config is None:
@@ -145,25 +170,36 @@ class AttentionConfig(StrictBaseModel):
             q_config.qk_dtype,
             q_config.v_dtype,
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
+            q_config.qk_sf_vec,
+            q_config.v_sf_vec,
         )
         if self.backend == "TRTLLM":
             if recipe not in SAGE_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
                     f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec, v_sf_vec): "
                     f"{sorted(SAGE_RECIPES)}."
                 )
         elif self.backend == "CUTEDSL":
-            if recipe not in QK16PV8_DTYPES:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
-                    f"{sorted(QK16PV8_DTYPES)}."
+                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec, v_sf_vec): "
+                    f"{sorted(CUTEDSL_RECIPES)}."
+                )
+        elif self.backend == "CUDNN":
+            if recipe not in CUDNN_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='CUDNN'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block), qk_sf_vec, v_sf_vec): "
+                    f"{sorted(CUDNN_RECIPES)}."
                 )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL', 'CUDNN'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )

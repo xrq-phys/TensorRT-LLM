@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL", "CUDNN")
 
     Returns:
         Diffusion attention backend class
@@ -51,8 +51,12 @@ def get_visual_gen_attention_backend(
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL FMHA kernels; uses packaged cubins when present,
                      otherwise compiles from CuTe DSL source
+        - "CUDNN": cuDNN MXFP8 SDPA; block-scaled FP8 attention.
+                   Requires nvidia-cudnn-frontend with MXFP8 SDPA support and
+                   Blackwell GPUs (sm100/sm103).
     """
     # Lazy imports to avoid circular dependency
+    from .cudnn import CuDNNAttention
     from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
     from .trtllm import TrtllmAttention
@@ -68,6 +72,8 @@ def get_visual_gen_attention_backend(
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
         return CuTeDSLAttention
+    elif backend_name == "CUDNN":
+        return CuDNNAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -94,7 +100,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL", "CUDNN")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -106,7 +112,7 @@ def create_attention(
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
         attention_config: Optional AttentionConfig; quant_attention_config is
-            extracted and forwarded to the TRTLLM backend when present.
+            extracted and forwarded to quantized backends when present.
         attention_metadata_state: Optional model-scoped metadata state from
             visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
@@ -117,8 +123,8 @@ def create_attention(
     attn_cls = get_visual_gen_attention_backend(backend)
 
     # Extract quant_attention_config from AttentionConfig and pass to backends
-    # that support it (TRTLLM SAGE recipes, CUTEDSL QK16PV8). AttentionConfig
-    # validation rejects unsupported (backend, recipe) combinations upstream.
+    # that support it. AttentionConfig validation rejects unsupported
+    # (backend, recipe) combinations upstream.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
