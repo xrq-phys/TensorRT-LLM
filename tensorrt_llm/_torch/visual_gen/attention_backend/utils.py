@@ -37,7 +37,8 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL",
+            "FLASHINFER_CUTEDSL")
 
     Returns:
         Diffusion attention backend class
@@ -55,6 +56,7 @@ def get_visual_gen_attention_backend(
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
+    from .flashinfer_cute_dsl import FlashInferCuTeDSLAttention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -68,6 +70,8 @@ def get_visual_gen_attention_backend(
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
         return CuTeDSLAttention
+    elif backend_name == "FLASHINFER_CUTEDSL":
+        return FlashInferCuTeDSLAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -94,7 +98,8 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL",
+            "FLASHINFER_CUTEDSL")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
