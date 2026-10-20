@@ -140,6 +140,27 @@ def _validate_inputs(
         raise ValueError(f"Output shape mismatch: {tuple(o.shape)} vs {expected_o_shape}")
 
 
+def _validate_varlen_kv(
+    q, k, v, o, kv_start, kv_len, is_causal, window_left, window_right, qk_sf_vec, scale_v_channels
+) -> None:
+    """Validate the (B, S, H, D) queries and the shared [1, N, H_kv, D] buffer of varlen K/V."""
+    if q.dim() != 4 or o.shape != q.shape or k.dim() != 4 or k.shape != v.shape:
+        raise ValueError("varlen K/V take 4D q and o and one shared 4D [1, N, H_kv, D] k and v.")
+    if k.shape[0] != 1 or k.shape[3] != q.shape[3] or q.shape[2] % k.shape[2]:
+        raise ValueError(f"q {tuple(q.shape)} does not fit the shared K/V buffer {tuple(k.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError(f"q, k and v dtypes differ: {q.dtype}, {k.dtype}, {v.dtype}")
+    if kv_len is None:
+        raise ValueError("kv_start requires kv_len.")
+    for name, t in (("kv_start", kv_start), ("kv_len", kv_len)):
+        if tuple(t.shape) != (q.shape[0],) or t.dtype != torch.int32 or not t.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous int32 tensor of [{q.shape[0]}].")
+    if is_causal or window_left != -1 or window_right != -1:
+        raise ValueError("varlen K/V are full attention within a range: no causal or window mask.")
+    if qk_sf_vec != 0 or scale_v_channels is not None:
+        raise ValueError("varlen K/V do not combine with block-scaled kernels.")
+
+
 def _to_cute_tensor(tensor: torch.Tensor, leading_dim: int, cutlass_element_type=None):
     """Wrap a torch tensor as a CuTe tensor.
 
@@ -204,6 +225,7 @@ class _CacheKey(NamedTuple):
     enable_ex2_emulation: bool
     enable_skip_correction: bool
     gpu_arch_str: str
+    varlen_kv: bool = False  # key lengths given apart from the start offsets
 
 
 _COMPILE_CACHE: dict = {}
@@ -279,11 +301,20 @@ def cute_dsl_fmha_fwd(
     q_sf: torch.Tensor | None = None,
     k_sf: torch.Tensor | None = None,
     qk_cutlass_dtype: Any = None,
+    kv_start: torch.Tensor | None = None,
+    kv_len: torch.Tensor | None = None,
 ) -> None:
     """JIT-compile (or fetch from cache) and launch the CuTe DSL FMHA kernel.
 
     Expects contiguous 4D (B, S, H, D) Q/K/V/O tensors with uniform per-batch sequence lengths.
     Varlen via indptr is intentionally not exposed — callers pack uniform-length sequences.
+
+    With `kv_start` and `kv_len` (``[B]`` int32 device tensors) K/V are one shared buffer
+    ``[1, N, H_kv, D]`` instead, and sequence ``b`` of Q attends to the K/V rows
+    ``[kv_start[b], kv_start[b] + kv_len[b])``. The ranges are free: they may overlap, repeat,
+    or be empty. An empty range writes neither `o` nor `lse` for its sequence, so the caller
+    initializes them. Only the plain dense kernel takes ranges: no mask, quantization,
+    skip-softmax or block-scaled path.
 
     When `qk_sf_vec` is non-zero, dispatches to the block-scaled kernel class:
     32 selects MXFP8 (Q/K stored as FP8 e4m3, SFs as Float8E8M0FNU uint8 storage);
@@ -297,7 +328,25 @@ def cute_dsl_fmha_fwd(
     )
 
     _check_cute_runtime_available()
-    _validate_inputs(q, k, v, o)
+    varlen_kv = kv_start is not None
+    if varlen_kv:
+        _validate_varlen_kv(
+            q,
+            k,
+            v,
+            o,
+            kv_start,
+            kv_len,
+            is_causal,
+            window_left,
+            window_right,
+            qk_sf_vec,
+            scale_v_channels,
+        )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("Skip-softmax does not combine with varlen K/V.")
+    else:
+        _validate_inputs(q, k, v, o)
     if qk_sf_vec != 0:
         if q_sf is None or k_sf is None:
             raise ValueError("Block-scaled path (qk_sf_vec != 0) requires q_sf and k_sf tensors.")
@@ -345,8 +394,13 @@ def cute_dsl_fmha_fwd(
 
     q_5d = q.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, qk_storage_dim)
     o_5d = o.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, value_head_dim)
-    k_5d = k.view(batch_size, seq_len_kv, num_heads_kv, 1, qk_storage_dim)
-    v_5d = v.view(batch_size, seq_len_kv, num_heads_kv, 1, value_head_dim)
+    if varlen_kv:
+        # One buffer every sequence indexes: the kernel takes it as variable-length K/V.
+        k_5d = k.view(seq_len_kv, num_heads_kv, qk_storage_dim)
+        v_5d = v.view(seq_len_kv, num_heads_kv, value_head_dim)
+    else:
+        k_5d = k.view(batch_size, seq_len_kv, num_heads_kv, 1, qk_storage_dim)
+        v_5d = v.view(batch_size, seq_len_kv, num_heads_kv, 1, value_head_dim)
     lse_4d = (
         lse.view(batch_size, seq_len_q, num_heads_kv, num_head_groups) if lse is not None else None
     )
@@ -398,10 +452,15 @@ def cute_dsl_fmha_fwd(
 
     # For the block-scaled paths Q/K may be FP4 (stored as torch.uint8) or FP8 e4m3; pass
     # qk_cutlass_dtype to override the inferred element type for FP4 (FP8 e4m3 is auto-detected).
+    kv_leading_dim = 2 if varlen_kv else 4
     q_cute = _to_cute_tensor(q_5d, leading_dim=4, cutlass_element_type=qk_cutlass_dtype)
-    k_cute = _to_cute_tensor(k_5d, leading_dim=4, cutlass_element_type=qk_cutlass_dtype)
-    v_cute = _to_cute_tensor(v_5d, leading_dim=4)
+    k_cute = _to_cute_tensor(
+        k_5d, leading_dim=kv_leading_dim, cutlass_element_type=qk_cutlass_dtype
+    )
+    v_cute = _to_cute_tensor(v_5d, leading_dim=kv_leading_dim)
     o_cute = _to_cute_tensor(o_5d, leading_dim=4)
+    kv_start_cute = _to_cute_tensor(kv_start, leading_dim=0) if varlen_kv else None
+    kv_len_cute = _to_cute_tensor(kv_len, leading_dim=0) if varlen_kv else None
     scale_output_tensor_cute = (
         _to_cute_tensor(scale_output_tensor.view(-1), leading_dim=0)
         if scale_output_tensor is not None
@@ -485,6 +544,7 @@ def cute_dsl_fmha_fwd(
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         gpu_arch_str=gpu_arch_str,
+        varlen_kv=varlen_kv,
     )
 
     if qk_sf_vec != 0:
@@ -523,15 +583,12 @@ def cute_dsl_fmha_fwd(
             o_cute,
             problem_size,
             None,  # cum_seqlen_q
-            None,  # cum_seqlen_k
+            kv_start_cute,  # cum_seqlen_k: with kv_len, the start offsets
             lse_cute,
             None,  # sink
             cute_typing.Float32(scale_softmax_log2_value),
-            scale_softmax_log2_tensor_cute,
             cute_typing.Float32(scale_softmax_value),
-            scale_softmax_tensor_cute,
             cute_typing.Float32(scale_output_value),
-            scale_output_tensor_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -539,6 +596,15 @@ def cute_dsl_fmha_fwd(
             None,  # total_softmax_count
             stream,
             False,  # use_pdl
+            None,  # page_table
+            None,  # o_sf_tensor
+            None,  # o_sf_scale
+            None,  # o_sf_start_index
+            None,  # dynamic_work_counter
+            scale_softmax_log2_tensor_cute,
+            scale_softmax_tensor_cute,
+            scale_output_tensor_cute,
+            kv_len_cute,
         )
 
     compiled = _get_or_compile(key, launch_args)
@@ -747,7 +813,11 @@ class CuTeDSLAttention(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len_q, num_heads, _ = q.shape
         value_head_dim = v.shape[-1]
-        out = torch.empty(
+        kv_start, kv_len = kwargs.get("kv_start"), kwargs.get("kv_len")
+        # A sequence with an empty K/V range is skipped by the kernel: its output is zero and
+        # its weight in a merge by LSE is zero.
+        make_tensor = torch.empty if kv_start is None else torch.zeros
+        out = make_tensor(
             batch_size,
             seq_len_q,
             num_heads,
@@ -762,6 +832,14 @@ class CuTeDSLAttention(AttentionBackend):
             dtype=torch.float32,
             device=q.device,
         )
+        if kv_start is not None:
+            if self.quant_attention_config is not None or self.sparse_params is not None:
+                raise NotImplementedError(
+                    "varlen K/V do not combine with quantized or sparse attention."
+                )
+            if self.skip_softmax_threshold_scale is not None:
+                raise NotImplementedError("varlen K/V do not combine with skip-softmax.")
+            lse.fill_(float("-inf"))
 
         # V is tensor-scaled by default. MXFP8/NVFP4 with v_block_size=1 use an (H, D) scale.
         v_dequant_scale = 1.0
@@ -810,6 +888,8 @@ class CuTeDSLAttention(AttentionBackend):
             q_sf=q_sf,
             k_sf=k_sf,
             qk_cutlass_dtype=qk_cutlass_dtype,
+            kv_start=kv_start,
+            kv_len=kv_len,
         )
         return out, lse
 
@@ -832,6 +912,10 @@ class CuTeDSLAttention(AttentionBackend):
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
+            kv_start, kv_len: ``[batch_size]`` int32 device tensors. When given, ``k`` and ``v``
+                are one shared buffer ``[1, N, num_kv_heads, head_dim]`` and sequence ``b`` of
+                ``q`` attends to the rows ``[kv_start[b], kv_start[b] + kv_len[b])`` of it. An
+                empty range gives zeros.
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
@@ -864,6 +948,9 @@ class CuTeDSLAttention(AttentionBackend):
 
     @classmethod
     def support_lse(cls) -> bool:
+        return True
+
+    def support_kv_window(self) -> bool:
         return True
 
     @property
