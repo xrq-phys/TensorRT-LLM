@@ -20,8 +20,12 @@ import torch
 from utils.cyclic_kv_reference import ReferenceWindowAttention, dense_window_reference
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cyclic_kv import CyclicKVAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.cache import CyclicKVCache
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -41,27 +45,40 @@ GEOMETRIES = [
 ]
 
 
+_NEEDS_BLACKWELL = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="needs Blackwell",
+)
+# Backends without a K/V window, which the wrapper calls once per block and range.
+PER_BLOCK_BACKENDS = {
+    "fa4": FlashAttn4Attention,
+    "flashinfer": FlashInferAttention,
+    "cudnn": CuDNNAttention,
+}
+
+
 @pytest.fixture(
     params=[
         "reference",
-        pytest.param(
-            "kernel",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-                reason="the CuTe DSL FMHA kernel needs Blackwell",
-            ),
-        ),
+        pytest.param("kernel", marks=_NEEDS_BLACKWELL),
+        *(pytest.param(name, marks=_NEEDS_BLACKWELL) for name in PER_BLOCK_BACKENDS),
     ]
 )
 def inner_backend(request):
-    """The backend the wrapper calls: the CuTe DSL kernel, and a torch reference, which checks
-    the wrapper and the cache alone."""
+    """The backend the wrapper calls: a torch reference, which checks the wrapper and the
+    cache alone; the CuTe DSL kernel, which attends to a K/V window; and backends that do
+    not, which the wrapper calls per block."""
 
     def make(layer_idx):
         if request.param == "reference":
             return ReferenceWindowAttention(HEAD_DIM)
-        return CuTeDSLAttention(
-            layer_idx=layer_idx, num_heads=NUM_HEADS, head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS
+        cls = PER_BLOCK_BACKENDS.get(request.param, CuTeDSLAttention)
+        return cls(
+            layer_idx=layer_idx,
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            num_kv_heads=NUM_KV_HEADS,
+            dtype=DTYPE,
         )
 
     return make
@@ -174,6 +191,8 @@ def test_a_short_final_chunk(inner_backend):
 def test_without_a_cache_it_is_the_inner_backend(inner_backend):
     attention = CyclicKVAttention(inner_backend(0), layer_idx=0)
     assert attention.support_lse()
+    if not attention.inner_backend.support_kv_window():
+        pytest.skip("the passthrough is checked with kv_start/kv_len")
     q = rand(1, 4, NUM_HEADS, HEAD_DIM)
     kv = rand(1, 16, NUM_KV_HEADS, HEAD_DIM)
     start = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -202,10 +221,6 @@ def test_rejects_unsupported_calls(inner_backend):
         attention.forward_with_lse(q, k, v, kv_cache=cache)
 
 
-def test_needs_a_backend_with_a_kv_window():
-    class NoWindow(ReferenceWindowAttention):
-        def support_kv_window(self):
-            return False
-
-    with pytest.raises(ValueError, match="cannot attend to a K/V window"):
-        CyclicKVAttention(NoWindow(HEAD_DIM), layer_idx=0)
+def test_needs_a_backend_with_lse():
+    with pytest.raises(ValueError, match="does not return the LSE"):
+        CyclicKVAttention(VanillaAttention(num_heads=NUM_HEADS, head_dim=HEAD_DIM), layer_idx=0)

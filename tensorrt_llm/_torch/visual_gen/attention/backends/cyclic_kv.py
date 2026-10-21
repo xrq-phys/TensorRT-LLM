@@ -24,23 +24,30 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 
 class CyclicKVAttention(AttentionBackend):
-    """Wraps a backend whose ``support_kv_window()`` and ``support_lse()`` are true.
+    """Wraps a backend whose ``support_lse()`` is true and whose layout is NHD.
 
     With a ``kv_cache`` the new tokens' K/V are staged in the cache and every causal block of
     them attends to the cache's fixed region and its window. Those are at most two ranges of
     the cache's buffer, which the inner backend attends to one at a time; the two partial
     results are merged by their LSE. Without a ``kv_cache`` this is the inner backend.
 
+    A backend whose ``support_kv_window()`` is true attends to a range for every block in one
+    call. Any other backend is called once per block and range, on a slice of the buffer:
+    correct but slow, and not capturable in a CUDA graph, since the slices are taken on the
+    host.
+
     It sits innermost among the wrappers of ``wrap_parallel_attention``, so the cache holds
     what one rank attends to: with Ulysses, its heads of the whole sequence.
     """
 
     def __init__(self, inner_backend: AttentionBackend, layer_idx: int) -> None:
-        if not (inner_backend.support_kv_window() and inner_backend.support_lse()):
+        if not inner_backend.support_lse():
             raise ValueError(
-                f"{type(inner_backend).__name__} cannot attend to a K/V window with LSE; "
-                "use CUTEDSL."
+                f"{type(inner_backend).__name__} does not return the LSE that merges the two "
+                "ranges of the cache; use CUTEDSL, FA4, FLASHINFER or CUDNN."
             )
+        if inner_backend.preferred_layout != AttentionTensorLayout.NHD:
+            raise ValueError(f"{type(inner_backend).__name__} does not take the NHD layout.")
         self.inner_backend = inner_backend
         self.layer_idx = layer_idx
 
@@ -111,10 +118,19 @@ class CyclicKVAttention(AttentionBackend):
         kv_cache.write_staged(self.layer_idx, k[0, :num_tokens], v[0, :num_tokens])
         k_buffer, v_buffer = kv_cache.kv_buffers(self.layer_idx)
         q_blocks = q[0, :num_tokens].reshape(num_blocks, block_size, num_heads, head_dim)
-        (out_a, lse_a), (out_b, lse_b) = (
-            self._attend_ranges(q_blocks, k_buffer[None], v_buffer[None], ranges, **kwargs)
-            for ranges in kv_cache.kv_ranges(num_blocks, block_size)
-        )
+        if self.inner_backend.support_kv_window():
+            (out_a, lse_a), (out_b, lse_b) = (
+                self._attend_ranges(q_blocks, k_buffer[None], v_buffer[None], ranges, **kwargs)
+                for ranges in kv_cache.kv_ranges(num_blocks, block_size)
+            )
+        else:
+            starts, lengths = kv_cache.kv_ranges_host(num_blocks, block_size)
+            (out_a, lse_a), (out_b, lse_b) = (
+                self._attend_ranges_per_block(
+                    q_blocks, k_buffer, v_buffer, starts[j], lengths[j], **kwargs
+                )
+                for j in range(2)
+            )
         merged_lse = torch.logaddexp(lse_a, lse_b)
         merged = out_a.float() * torch.exp(lse_a - merged_lse).unsqueeze(-1) + out_b.float() * (
             torch.exp(lse_b - merged_lse).unsqueeze(-1)
@@ -143,6 +159,38 @@ class CyclicKVAttention(AttentionBackend):
             q_blocks, k_buffer, v_buffer, kv_start=kv_start, kv_len=kv_len, **kwargs
         )
         return out, lse.transpose(1, 2)
+
+    def _attend_ranges_per_block(
+        self,
+        q_blocks: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        starts,
+        lengths,
+        **kwargs,
+    ):
+        """``_attend_ranges`` for a backend without ``support_kv_window()``: one call per block
+        over its slice of the buffer, ``starts``/``lengths`` being host arrays."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"{type(self.inner_backend).__name__} attends to the cache per block on the "
+                "host, which a CUDA graph cannot capture; use CUTEDSL."
+            )
+        num_blocks, block_size, num_heads, head_dim = q_blocks.shape
+        out = torch.zeros_like(q_blocks)
+        lse = torch.full((num_blocks, block_size, num_heads), float("-inf"), device=q_blocks.device)
+        for i, (start, length) in enumerate(zip(starts.tolist(), lengths.tolist())):
+            if length == 0:
+                continue
+            out_i, lse_i = self.inner_backend.forward_with_lse(
+                q_blocks[i : i + 1],
+                k_buffer[None, start : start + length],
+                v_buffer[None, start : start + length],
+                **{**kwargs, "batch_size": 1, "seq_len": block_size, "seq_len_kv": length},
+            )
+            out[i] = out_i[0]
+            lse[i] = lse_i[0].transpose(0, 1)
+        return out, lse
 
     def forward_with_lse(self, q, k, v, **kwargs):
         if kwargs.get("kv_cache") is not None:

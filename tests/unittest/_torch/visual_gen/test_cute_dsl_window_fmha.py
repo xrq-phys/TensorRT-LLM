@@ -14,6 +14,8 @@
 # limitations under the License.
 """Query sequences over free ranges of one shared K/V buffer, against a torch reference."""
 
+import math
+
 import pytest
 import torch
 
@@ -62,7 +64,8 @@ def run_case(starts, lens, seq_len, heads, heads_kv, head_dim, num_rows, dtype=t
     )
     want_out, want_lse = reference(q, k, v, starts, lens, scale)
     torch.testing.assert_close(out.float(), want_out, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(lse, want_lse, rtol=1e-3, atol=1e-3)
+    # The kernel's LSE is in base 2.
+    torch.testing.assert_close(lse * math.log(2.0), want_lse, rtol=1e-3, atol=1e-3)
 
 
 CASES = [

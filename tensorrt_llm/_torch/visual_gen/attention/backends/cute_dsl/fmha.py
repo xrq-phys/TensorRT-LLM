@@ -320,6 +320,8 @@ def cute_dsl_fmha_fwd(
     32 selects MXFP8 (Q/K stored as FP8 e4m3, SFs as Float8E8M0FNU uint8 storage);
     16 selects NVFP4 (Q/K stored as packed FP4 in torch.uint8, SFs as Float8E4M3FN in uint8 storage).
     When `sparse_params` is set, its timestep-aware scheduler overrides the direct threshold.
+
+    `lse`, when given, receives the kernel's log-sum-exp of the scaled scores in base 2.
     """
     skip_softmax_threshold_scale_factor = _resolve_skip_softmax_threshold_scale_factor(
         skip_softmax_threshold_scale_factor,
@@ -936,15 +938,16 @@ class CuTeDSLAttention(AttentionBackend):
 
         Returns:
             output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
-                    always in float32. Used for numerically stable combination of
+            lse:    [batch_size, num_heads, seq_len] - natural-log log-sum-exp per query
+                    position, always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
-        return output, lse.transpose(1, 2)
+        # The kernel's LSE is in base 2; the contract is the natural logarithm.
+        return output, (lse * math.log(2.0)).transpose(1, 2)
 
     @classmethod
     def support_lse(cls) -> bool:

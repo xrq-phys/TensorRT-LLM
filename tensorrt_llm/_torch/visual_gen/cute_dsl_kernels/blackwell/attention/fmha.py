@@ -2506,6 +2506,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 seqlen_q,
                             )
                         )
+                    # The correction warp produces no O for an empty key range, so do
+                    # not wait for one.
+                    if not continue_cond:
+                        seqlen_k = mK_kdl.shape[0]
+                        if cutlass.const_expr(cum_seqlen_k is not None and kv_len_tensor is None):
+                            seqlen_k = cum_seqlen_k[batch_coord + 1] - cum_seqlen_k[batch_coord]
+                        if cutlass.const_expr(kv_len_tensor is not None):
+                            seqlen_k = kv_len_tensor[batch_coord]
+                        continue_cond = seqlen_k <= 0
                     if not continue_cond:
                         o0_coord = 2 * curr_block_coord[0]
                         o1_coord = o0_coord + 1

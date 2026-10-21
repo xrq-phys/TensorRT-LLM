@@ -243,6 +243,12 @@ class CyclicKVCache:
             self._fill_ranges(key, ranges)
         return ranges
 
+    def kv_ranges_host(self, num_blocks: int, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """``kv_ranges`` as host arrays ``(starts, lengths)``, each ``[2, num_blocks]`` int32:
+        row ``j`` is range ``j``. Reflects the current commit; for callers that slice the
+        buffer per block on the host."""
+        return self._range_table(num_blocks, block_size)
+
     # ------------------------------------------------------------------ device state
 
     def _refresh(self) -> None:
@@ -253,7 +259,12 @@ class CyclicKVCache:
             self._fill_ranges(key, ranges)
 
     def _fill_ranges(self, key: Tuple[int, int], ranges: Tuple[Range, Range]) -> None:
-        num_blocks, block_size = key
+        starts, lengths = self._range_table(*key)
+        for j, (start, length) in enumerate(ranges):
+            start.copy_(torch.from_numpy(starts[j]))
+            length.copy_(torch.from_numpy(lengths[j]))
+
+    def _range_table(self, num_blocks: int, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
         fixed, ring = self.pin_tokens, self.ring_tokens
         starts = np.zeros((2, num_blocks), dtype=np.int32)
         lengths = np.zeros((2, num_blocks), dtype=np.int32)
@@ -278,9 +289,7 @@ class CyclicKVCache:
                 lengths[0, i] = first_end
                 starts[1, i] = second_start
                 lengths[1, i] = length - wrapped
-        for j, (start, length) in enumerate(ranges):
-            start.copy_(torch.from_numpy(starts[j]))
-            length.copy_(torch.from_numpy(lengths[j]))
+        return starts, lengths
 
 
 def _check_geometry(pin_tokens: int, window_tokens: int, max_staged_tokens: int) -> None:
